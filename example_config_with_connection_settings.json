@@ -1,0 +1,122 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "connection_settings": {
+        "retry_attempts": 3,
+        "retry_delay": 2.0,
+        "connection_timeout": 30.0
+      }
+    },
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=America/New_York"],
+      "connection_settings": {
+        "retry_attempts": 5,
+        "retry_delay": 1.5,
+        "connection_timeout": 45.0
+      }
+    },
+    "mcp_sse_basic": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8001/sse",
+      "connection_settings": {
+        "retry_attempts": 3,
+        "retry_delay": 2.0,
+        "connection_timeout": 30.0,
+        "sse_read_timeout": 60.0,
+        "health_check_interval": 60
+      }
+    },
+    "mcp_sse_with_auth": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8002/sse",
+      "headers": {
+        "Authorization": "Bearer your-secret-token",
+        "X-API-Key": "your-api-key",
+        "User-Agent": "mcpo/0.0.14"
+      },
+      "connection_settings": {
+        "retry_attempts": 5,
+        "retry_delay": 3.0,
+        "connection_timeout": 45.0,
+        "sse_read_timeout": 120.0,
+        "health_check_interval": 30
+      }
+    },
+    "mcp_streamable_basic": {
+      "type": "streamable_http",
+      "url": "http://127.0.0.1:8003/mcp",
+      "connection_settings": {
+        "retry_attempts": 3,
+        "retry_delay": 2.0,
+        "connection_timeout": 30.0,
+        "health_check_interval": 60
+      }
+    },
+    "mcp_streamable_with_auth": {
+      "type": "streamable_http",
+      "url": "http://127.0.0.1:8004/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-token",
+        "X-Custom-Header": "custom-value",
+        "Content-Type": "application/json"
+      },
+      "connection_settings": {
+        "retry_attempts": 5,
+        "retry_delay": 2.5,
+        "connection_timeout": 60.0,
+        "health_check_interval": 45
+      }
+    },
+    "external_api_with_headers": {
+      "type": "sse",
+      "url": "https://api.example.com/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer prod-token-12345",
+        "X-Client-ID": "mcpo-client",
+        "X-Version": "1.0",
+        "Accept": "application/json"
+      },
+      "connection_settings": {
+        "retry_attempts": 10,
+        "retry_delay": 5.0,
+        "connection_timeout": 120.0,
+        "sse_read_timeout": 300.0,
+        "health_check_interval": 30
+      }
+    },
+    "unreliable_server": {
+      "type": "streamable_http",
+      "url": "http://unreliable-server.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer unreliable-token"
+      },
+      "connection_settings": {
+        "retry_attempts": 10,
+        "retry_delay": 1.0,
+        "connection_timeout": 15.0,
+        "health_check_interval": 15,
+        "description": "配置用于不稳定的服务器，更频繁的重试和健康检查"
+      }
+    }
+  },
+  "global_connection_settings": {
+    "default_retry_attempts": 3,
+    "default_retry_delay": 2.0,
+    "default_connection_timeout": 30.0,
+    "default_sse_read_timeout": 60.0,
+    "default_health_check_interval": 60,
+    "enable_connection_logging": true,
+    "enable_health_monitoring": true
+  },
+  "description": "这个配置文件展示了如何为不同的MCP服务器配置连接设置。connection_settings部分是可选的，如果不提供将使用默认值。",
+  "connection_settings_explanation": {
+    "retry_attempts": "连接失败时的重试次数",
+    "retry_delay": "重试之间的延迟时间（秒），使用指数退避",
+    "connection_timeout": "单次连接尝试的超时时间（秒）",
+    "sse_read_timeout": "SSE连接的读取超时时间（秒），仅适用于SSE类型",
+    "health_check_interval": "健康检查的间隔时间（秒）"
+  }
+}

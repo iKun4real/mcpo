@@ -1,0 +1,48 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time", "--local-timezone=America/New_York"]
+    },
+    "mcp_sse_basic": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8001/sse"
+    },
+    "mcp_sse_with_auth": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8002/sse",
+      "headers": {
+        "Authorization": "Bearer your-secret-token",
+        "X-API-Key": "your-api-key",
+        "User-Agent": "mcpo/0.0.14"
+      }
+    },
+    "mcp_streamable_basic": {
+      "type": "streamable_http",
+      "url": "http://127.0.0.1:8003/mcp"
+    },
+    "mcp_streamable_with_auth": {
+      "type": "streamable_http",
+      "url": "http://127.0.0.1:8004/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-token",
+        "X-Custom-Header": "custom-value",
+        "Content-Type": "application/json"
+      }
+    },
+    "external_api_with_headers": {
+      "type": "sse",
+      "url": "https://api.example.com/mcp/sse",
+      "headers": {
+        "Authorization": "Bearer prod-token-12345",
+        "X-Client-ID": "mcpo-client",
+        "X-Version": "1.0",
+        "Accept": "application/json"
+      }
+    }
+  }
+}

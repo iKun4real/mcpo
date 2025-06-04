@@ -1,0 +1,12 @@
+services:
+  mcpo:
+    image: mcpo
+    container_name: mcpo
+    restart: unless-stopped
+    command: ["--config", "/app/config.json", "--api-key", "${API_KEY}"]
+    ports:
+      - 8000:8000
+    volumes:
+      - ./config.json:/app/config.json
+    environment:
+      - API_KEY=${API_KEY}
