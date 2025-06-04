@@ -130,32 +130,35 @@ class ReconnectManager:
                 factory = self.connection_factories[name]
                 config = self.connection_configs[name]
                 
-                # 尝试重新建立连接
-                connection_context = await self._retry_connection(factory, name)
-                
+                # 尝试重新建立连接，添加超时保护
+                connection_context = await asyncio.wait_for(
+                    self._retry_connection(factory, name),
+                    timeout=30.0
+                )
+
                 # 测试连接
                 async with connection_context as connection_result:
                     if len(connection_result) == 2:
                         reader, writer = connection_result
                     else:
                         reader, writer, _ = connection_result
-                    
+
                     # 创建新的会话
                     async with ClientSession(reader, writer) as new_session:
-                        # 测试会话是否正常
-                        await new_session.list_tools()
-                        
+                        # 测试会话是否正常，添加超时保护
+                        await asyncio.wait_for(new_session.list_tools(), timeout=5.0)
+
                         # 更新连接
                         self.connections[name] = new_session
-                        
+
                         # 更新应用状态
                         if name in self.apps:
                             self.apps[name].state.session = new_session
-                        
+
                         # 记录成功
                         self.record_success(name)
                         status["reconnect_attempts"] = 0  # 重置重连次数
-                        
+
                         logger.info(f"成功重连 {name}")
                         return True
                         
@@ -165,18 +168,24 @@ class ReconnectManager:
                 return False
     
     async def _retry_connection(self, factory: Callable, name: str, max_attempts: int = 3):
-        """重试连接"""
+        """重试连接，每次尝试都有超时保护"""
         last_exception = None
-        
+
         for attempt in range(max_attempts):
             try:
                 logger.debug(f"重连 {name} 尝试 {attempt + 1}/{max_attempts}")
-                return await factory()
+                # 为每次连接尝试添加超时保护
+                return await asyncio.wait_for(factory(), timeout=15.0)
+            except asyncio.TimeoutError:
+                last_exception = Exception(f"连接超时 (15秒)")
+                logger.warning(f"连接 {name} 超时 (尝试 {attempt + 1}/{max_attempts})")
             except Exception as e:
                 last_exception = e
-                if attempt < max_attempts - 1:
-                    await asyncio.sleep(2 ** attempt)  # 指数退避
-        
+                logger.warning(f"连接 {name} 失败 (尝试 {attempt + 1}/{max_attempts}): {str(e)}")
+
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(2 ** attempt)  # 指数退避
+
         raise last_exception
     
     async def get_healthy_session(self, name: str) -> Optional[ClientSession]:
@@ -186,9 +195,9 @@ class ReconnectManager:
 
         session = self.connections[name]
 
-        # 先进行实时健康检查
+        # 先进行实时健康检查，统一使用3秒超时
         try:
-            await asyncio.wait_for(session.list_tools(), timeout=5.0)
+            await asyncio.wait_for(session.list_tools(), timeout=3.0)
             # 更新健康状态
             if name in self.connection_status:
                 self.connection_status[name].update({
@@ -197,6 +206,9 @@ class ReconnectManager:
                     "last_error": None
                 })
             return session
+        except asyncio.TimeoutError:
+            logger.warning(f"会话 {name} 健康检查超时 (3秒)")
+            self.record_error(name, "会话健康检查超时")
         except Exception as e:
             logger.warning(f"会话 {name} 健康检查失败: {str(e)}")
             self.record_error(name, f"会话健康检查失败: {str(e)}")
@@ -280,11 +292,15 @@ async def resilient_streamable_connection(url: str, headers: Dict[str, str] = No
     for attempt in range(max_attempts):
         try:
             logger.info(f"尝试连接到 {url} (第 {attempt + 1}/{max_attempts} 次)")
-            connection_context = await create_connection()
+            # 为连接创建添加超时保护
+            connection_context = await asyncio.wait_for(create_connection(), timeout=20.0)
 
             async with connection_context as connection_result:
                 reader, writer, _ = connection_result
                 async with ClientSession(reader, writer) as session:
+                    # 测试会话是否正常，添加超时保护
+                    await asyncio.wait_for(session.list_tools(), timeout=5.0)
+
                     # 注册到重连管理器
                     reconnect_manager.register_connection(
                         connection_name,

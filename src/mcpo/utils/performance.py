@@ -151,7 +151,7 @@ class RequestDeduplicator:
                     del self._pending_requests[key]
     
     async def _periodic_cleanup(self):
-        """定期清理过期请求"""
+        """定期清理过期请求，增强错误处理"""
         while True:
             try:
                 await asyncio.sleep(self.ttl)
@@ -164,15 +164,25 @@ class RequestDeduplicator:
                     for key in completed_keys:
                         del self._pending_requests[key]
             except asyncio.CancelledError:
+                logger.info("请求去重清理任务被取消")
                 break
             except Exception as e:
                 logger.error(f"请求去重清理时出错: {e}")
+                # 短暂等待后继续，避免快速循环
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    break
     
     async def close(self):
-        """关闭去重器"""
-        if self._cleanup_task:
+        """关闭去重器，确保资源正确释放"""
+        if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
-        
+            try:
+                await asyncio.wait_for(self._cleanup_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
         # 取消所有待处理的请求
         async with self._lock:
             for future in self._pending_requests.values():

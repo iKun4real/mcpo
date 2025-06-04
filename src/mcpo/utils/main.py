@@ -23,13 +23,7 @@ from mcp.shared.exceptions import McpError
 from pydantic import Field, create_model
 from pydantic.fields import FieldInfo
 
-# 导入性能优化组件
-from .cache import cache_manager, should_cache_response, get_cache_ttl
-from .performance import (
-    concurrency_limiter,
-    request_deduplicator,
-    performance_monitor
-)
+# 专注于核心功能，移除性能优化组件
 
 MCP_ERROR_TO_HTTP_STATUS = {
     PARSE_ERROR: 400,
@@ -227,33 +221,10 @@ def get_tool_handler(
             async def tool(form_data: FormModel) -> ResponseModel:
                 args = form_data.model_dump(exclude_none=True)
 
-                # 性能监控
-                async with performance_monitor.monitor_request(endpoint_name):
-                    # 并发控制
-                    async with concurrency_limiter.acquire():
-                        # 检查缓存
-                        cache = cache_manager.get_cache()
-                        cached_result = await cache.get(endpoint_name, args)
-                        if cached_result is not None:
-                            logging.debug(f"缓存命中: {endpoint_name}")
-                            return cached_result
-
-                        # 请求去重
-                        async def execute_request():
-                            return await _execute_tool_request(
-                                endpoint_name, args, session, connection_name, connection_manager
-                            )
-
-                        result = await request_deduplicator.execute_or_wait(
-                            endpoint_name, args, execute_request
-                        )
-
-                        # 缓存结果
-                        if should_cache_response(endpoint_name, args, result):
-                            ttl = get_cache_ttl(endpoint_name, args)
-                            await cache.set(endpoint_name, args, result, ttl)
-
-                        return result
+                # 直接执行工具请求，专注于网络错误处理
+                return await _execute_tool_request(
+                    endpoint_name, args, session, connection_name, connection_manager
+                )
 
             return tool
 
@@ -264,33 +235,10 @@ def get_tool_handler(
             endpoint_name: str, session: ClientSession
         ):  # Parameterless endpoint
             async def tool():  # No parameters
-                # 性能监控
-                async with performance_monitor.monitor_request(endpoint_name):
-                    # 并发控制
-                    async with concurrency_limiter.acquire():
-                        # 检查缓存
-                        cache = cache_manager.get_cache()
-                        cached_result = await cache.get(endpoint_name, {})
-                        if cached_result is not None:
-                            logging.debug(f"缓存命中: {endpoint_name}")
-                            return cached_result
-
-                        # 请求去重
-                        async def execute_request():
-                            return await _execute_tool_request(
-                                endpoint_name, {}, session, connection_name, connection_manager
-                            )
-
-                        result = await request_deduplicator.execute_or_wait(
-                            endpoint_name, {}, execute_request
-                        )
-
-                        # 缓存结果
-                        if should_cache_response(endpoint_name, {}, result):
-                            ttl = get_cache_ttl(endpoint_name, {})
-                            await cache.set(endpoint_name, {}, result, ttl)
-
-                        return result
+                # 直接执行工具请求，专注于网络错误处理
+                return await _execute_tool_request(
+                    endpoint_name, {}, session, connection_name, connection_manager
+                )
 
             return tool
 
@@ -306,7 +254,7 @@ async def _execute_tool_request(
     connection_name: str,
     connection_manager=None
 ) -> Any:
-    """执行工具请求的核心逻辑，支持自动重连和会话状态同步"""
+    """执行工具请求的核心逻辑，专注于网络错误处理和防卡死"""
     logger.debug(f"开始执行工具请求: {endpoint_name}, 连接: {connection_name}")
 
     # 使用传入的连接管理器，如果没有则导入全局的（避免循环导入）
@@ -316,51 +264,36 @@ async def _execute_tool_request(
     from mcpo.utils.reconnect_manager import reconnect_manager, handle_connection_error
 
     max_retries = 3  # 最多重试3次
-    original_session = session  # 保存原始会话引用
+    base_timeout = 30.0  # 基础超时时间
 
     for attempt in range(max_retries + 1):
         try:
-            # 获取当前最新的健康会话
-            current_session = await _get_current_healthy_session(
-                session, connection_name, reconnect_manager, connection_manager
-            )
+            # 快速验证会话是否可用
+            if not session:
+                logger.warning(f"会话为空，尝试获取新会话: {connection_name}")
+                session = await reconnect_manager.get_healthy_session(connection_name)
+                if not session:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"message": "MCP服务器连接不可用", "error": "无法获取健康会话"}
+                    )
 
-            if not current_session:
-                error_msg = f"无法获取健康的会话连接: {connection_name}"
-                logger.error(error_msg)
-                connection_manager.record_connection_error(connection_name, error_msg)
-                raise HTTPException(
-                    status_code=503,
-                    detail={"message": "MCP服务器连接不可用", "error": error_msg}
-                )
+            # 动态调整超时时间（重试时增加超时）
+            current_timeout = base_timeout + (attempt * 10)  # 每次重试增加10秒
 
-            # 更新会话引用
-            session = current_session
+            logger.debug(f"调用工具 {endpoint_name} (尝试 {attempt + 1}/{max_retries + 1}, 超时: {current_timeout}s)")
 
-            # 添加超时机制防止长时间卡住
-            logger.debug(f"调用工具 {endpoint_name} (尝试 {attempt + 1}/{max_retries + 1})")
+            # 使用超时保护执行工具调用
             result = await asyncio.wait_for(
                 session.call_tool(endpoint_name, arguments=args),
-                timeout=30.0  # 30秒超时
+                timeout=current_timeout
             )
 
             # 检查工具执行结果
             if result.isError:
                 error_message = "Unknown tool execution error"
-                error_data = None
-
-                if result.content:
-                    if isinstance(result.content[0], types.TextContent):
-                        error_message = result.content[0].text
-                        try:
-                            # 尝试解析错误数据
-                            error_data = json.loads(error_message) if error_message.startswith('{') else None
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-
-                detail = {"message": error_message}
-                if error_data is not None:
-                    detail["data"] = error_data
+                if result.content and isinstance(result.content[0], types.TextContent):
+                    error_message = result.content[0].text
 
                 # 记录工具执行错误
                 logger.warning(f"工具执行错误 {endpoint_name}: {error_message}")
@@ -369,7 +302,7 @@ async def _execute_tool_request(
                 # 对于工具执行错误，不进行重试，直接返回500
                 raise HTTPException(
                     status_code=500,
-                    detail=detail,
+                    detail={"message": error_message}
                 )
 
             # 记录成功调用
@@ -377,132 +310,74 @@ async def _execute_tool_request(
             logger.debug(f"工具调用成功: {endpoint_name}")
 
             response_data = process_tool_response(result)
-            final_response = (
-                response_data[0] if len(response_data) == 1 else response_data
-            )
-            return final_response
+            return response_data[0] if len(response_data) == 1 else response_data
 
         except HTTPException:
             # HTTPException直接抛出，不重试
             raise
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
             # 超时错误，记录并尝试重连
-            timeout_error = f"工具调用超时 (30秒): {endpoint_name}"
+            timeout_error = f"工具调用超时 ({current_timeout}秒): {endpoint_name}"
             logger.warning(f"{timeout_error} (尝试 {attempt + 1}/{max_retries + 1})")
             connection_manager.record_connection_error(connection_name, timeout_error)
 
-            # 尝试处理超时错误并重连
-            error_handled = await handle_connection_error(connection_name, Exception(timeout_error))
+            if attempt < max_retries:
+                logger.info(f"超时后尝试重连并重试: {endpoint_name}")
+                # 尝试重连
+                success = await reconnect_manager.attempt_reconnect(connection_name)
+                if success:
+                    session = await reconnect_manager.get_healthy_session(connection_name)
+                    continue
+                else:
+                    logger.warning(f"重连失败: {connection_name}")
 
-            if error_handled and attempt < max_retries:
-                logger.info(f"超时后重连成功，重试工具调用 {endpoint_name} (尝试 {attempt + 2}/{max_retries + 1})")
-                # 强制刷新会话状态
-                await _refresh_session_state(connection_name, reconnect_manager)
-                continue
-
-            # 如果重连失败或达到最大重试次数
-            if attempt == max_retries:
-                raise HTTPException(
-                    status_code=504,
-                    detail={"message": "工具调用超时", "error": timeout_error}
-                )
+            # 最后一次尝试失败
+            raise HTTPException(
+                status_code=504,
+                detail={"message": "工具调用超时", "error": timeout_error}
+            )
         except Exception as e:
             error_str = str(e).lower()
             logger.warning(f"工具调用异常 {endpoint_name}: {str(e)} (尝试 {attempt + 1}/{max_retries + 1})")
+            connection_manager.record_connection_error(connection_name, str(e))
 
-            # 特殊处理524错误：直接重试请求，不需要重连
-            if "524" in error_str and attempt < max_retries:
-                logger.warning(f"检测到524错误，直接重试请求 {endpoint_name} (尝试 {attempt + 2}/{max_retries + 1})")
-                connection_manager.record_connection_error(connection_name, f"524错误重试: {str(e)}")
+            # 检查是否是网络相关错误
+            network_errors = ["connection", "network", "timeout", "502", "503", "504", "524", "520", "521", "522", "523", "525"]
+            is_network_error = any(keyword in error_str for keyword in network_errors)
+
+            if is_network_error and attempt < max_retries:
+                logger.info(f"检测到网络错误，尝试重连: {endpoint_name}")
+                # 等待一段时间后重试
                 await asyncio.sleep(min(2 ** attempt, 5))  # 指数退避，最大5秒
-                continue
 
-            # 对于其他错误，尝试处理连接错误并重连
-            error_handled = await handle_connection_error(connection_name, e)
-
-            if error_handled and attempt < max_retries:
-                # 如果错误被处理（重连成功）且还有重试机会，则重试
-                logger.info(f"重连成功，重试工具调用 {endpoint_name} (尝试 {attempt + 2}/{max_retries + 1})")
-                # 强制刷新会话状态
-                await _refresh_session_state(connection_name, reconnect_manager)
-                continue
-
-            # 如果无法处理错误或已达到最大重试次数，则抛出异常
-            if attempt == max_retries:
-                # 最后一次尝试失败，抛出原始异常
-                logger.error(f"工具调用 {endpoint_name} 最终失败: {str(e)}")
-                connection_manager.record_connection_error(connection_name, str(e))
-
-                # 根据错误类型返回适当的HTTP状态码
-                if any(keyword in error_str for keyword in ["connection", "network", "timeout", "502", "503", "504", "520", "521", "522", "523", "524", "525"]):
-                    status_code = 503
-                    detail_message = f"MCP服务器连接问题: {str(e)}"
+                # 尝试重连
+                success = await reconnect_manager.attempt_reconnect(connection_name)
+                if success:
+                    session = await reconnect_manager.get_healthy_session(connection_name)
+                    continue
                 else:
-                    status_code = 500
-                    detail_message = "工具执行失败"
+                    logger.warning(f"重连失败: {connection_name}")
 
-                raise HTTPException(
-                    status_code=status_code,
-                    detail={"message": detail_message, "error": str(e)},
-                )
+            # 最后一次尝试失败
+            if attempt == max_retries:
+                logger.error(f"工具调用 {endpoint_name} 最终失败: {str(e)}")
+
+                if is_network_error:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"message": f"MCP服务器连接问题: {str(e)}"}
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail={"message": f"工具执行失败: {str(e)}"}
+                    )
 
     # 如果所有重试都失败，这里不应该到达
     raise HTTPException(
         status_code=500,
-        detail={"message": "未知错误", "error": "所有重试尝试都失败"}
+        detail={"message": "所有重试尝试都失败"}
     )
 
 
-async def _get_current_healthy_session(
-    session: ClientSession,
-    connection_name: str,
-    reconnect_manager,
-    connection_manager
-) -> Optional[ClientSession]:
-    """获取当前健康的会话，如果当前会话不健康则尝试获取新的"""
-    try:
-        # 首先检查当前会话是否健康
-        if session:
-            try:
-                # 快速健康检查
-                await asyncio.wait_for(session.list_tools(), timeout=5.0)
-                return session
-            except Exception as e:
-                logger.warning(f"当前会话不健康: {str(e)}")
-                connection_manager.record_connection_error(connection_name, f"会话健康检查失败: {str(e)}")
-
-        # 尝试从重连管理器获取健康会话
-        healthy_session = await reconnect_manager.get_healthy_session(connection_name)
-        if healthy_session:
-            logger.info(f"获取到健康会话: {connection_name}")
-            return healthy_session
-
-        logger.error(f"无法获取健康会话: {connection_name}")
-        return None
-
-    except Exception as e:
-        logger.error(f"获取健康会话时发生异常: {str(e)}")
-        return None
-
-
-async def _refresh_session_state(connection_name: str, reconnect_manager):
-    """刷新会话状态，确保使用最新的连接"""
-    try:
-        # 强制重新获取会话状态
-        await reconnect_manager.refresh_connection_state(connection_name)
-        logger.debug(f"已刷新会话状态: {connection_name}")
-    except Exception as e:
-        logger.warning(f"刷新会话状态失败: {str(e)}")
-
-
-async def _validate_session_health(session: ClientSession, timeout: float = 5.0) -> bool:
-    """验证会话健康状态"""
-    try:
-        if not session:
-            return False
-
-        # 执行简单的健康检查
-        await asyncio.wait_for(session.list_tools(), timeout=timeout)
-        return True
-    except Exception:
-        return False
+# 删除了复杂的辅助函数，保持代码简洁

@@ -102,8 +102,8 @@ class ConnectionManager:
     async def check_connection_health(self, name: str, session: ClientSession):
         """按需检查连接健康状态（仅在用户请求时调用）"""
         try:
-            # 尝试列出工具来检查连接是否正常
-            await session.list_tools()
+            # 尝试列出工具来检查连接是否正常，统一使用3秒超时
+            await asyncio.wait_for(session.list_tools(), timeout=3.0)
 
             # 更新连接状态
             if name in self.connection_status:
@@ -114,6 +114,16 @@ class ConnectionManager:
                 })
 
             return True
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.manager_id}] 连接 {name} 健康检查超时 (3秒)")
+            # 更新连接状态
+            if name in self.connection_status:
+                self.connection_status[name].update({
+                    "status": "unhealthy",
+                    "last_error": "健康检查超时",
+                    "last_check": asyncio.get_event_loop().time()
+                })
+            return False
         except Exception as e:
             logger.warning(f"[{self.manager_id}] 连接 {name} 健康检查失败: {str(e)}")
 
@@ -268,58 +278,18 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None, connection
                     }
                 }
 
-        # 添加性能监控端点
-        @app.get("/metrics", summary="性能指标", description="获取性能监控数据")
-        async def get_metrics():
-            """获取性能监控指标"""
+        # 添加简单的连接状态端点
+        @app.get("/status", summary="连接状态", description="获取MCP连接状态")
+        async def get_status():
+            """获取连接状态"""
             try:
-                from mcpo.utils.performance import performance_monitor, concurrency_limiter
-                from mcpo.utils.cache import cache_manager
-                from mcpo.utils.error_recovery import error_recovery_manager
-                from mcpo.utils.system_monitor import system_monitor
-
                 return {
-                    "performance": performance_monitor.get_metrics(),
-                    "concurrency": concurrency_limiter.get_stats(),
-                    "cache": cache_manager.get_all_stats(),
                     "connection": connection_manager.get_connection_status(connection_name),
-                    "error_recovery": error_recovery_manager.get_error_statistics(),
-                    "system_health": error_recovery_manager.get_system_health().__dict__,
                     "timestamp": time.time()
                 }
             except Exception as e:
-                logger.error(f"获取性能指标失败: {str(e)}")
+                logger.error(f"获取连接状态失败: {str(e)}")
                 return {
-                    "error": str(e),
-                    "timestamp": time.time()
-                }
-
-        # 添加系统诊断端点
-        @app.get("/diagnostics", summary="系统诊断", description="执行系统诊断并返回结果")
-        async def system_diagnostics():
-            """系统诊断"""
-            try:
-                from mcpo.utils.system_monitor import system_monitor
-                from mcpo.utils.reconnect_manager import reconnect_manager
-
-                # 执行诊断
-                diagnostic_result = await system_monitor.diagnose_system()
-
-                # 验证所有连接
-                connection_health = await reconnect_manager.validate_all_connections()
-
-                return {
-                    "status": diagnostic_result.status,
-                    "issues": diagnostic_result.issues,
-                    "recommendations": diagnostic_result.recommendations,
-                    "metrics": diagnostic_result.metrics.__dict__ if diagnostic_result.metrics else None,
-                    "connection_health": connection_health,
-                    "timestamp": time.time()
-                }
-            except Exception as e:
-                logger.error(f"系统诊断失败: {str(e)}")
-                return {
-                    "status": "error",
                     "error": str(e),
                     "timestamp": time.time()
                 }
@@ -333,14 +303,8 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None, connection
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动监控系统
-    from mcpo.utils.system_monitor import system_monitor
-    from mcpo.utils.error_recovery import error_recovery_manager
-
+    # 简化启动逻辑，专注于核心功能
     try:
-        # 启动系统监控
-        await system_monitor.start_monitoring()
-        logger.info("系统监控已启动")
 
         server_type = getattr(app.state, "server_type", "stdio")
         command = getattr(app.state, "command", None)
@@ -449,20 +413,8 @@ async def lifespan(app: FastAPI):
                     raise
 
     finally:
-        # 关闭监控系统
-        try:
-            await system_monitor.stop_monitoring()
-            logger.info("系统监控已停止")
-        except Exception as e:
-            logger.error(f"停止系统监控时出错: {str(e)}")
-
-        # 清理缓存
-        try:
-            from mcpo.utils.cache import cache_manager
-            await cache_manager.default_cache.cleanup_and_shutdown()
-            logger.info("缓存系统已清理")
-        except Exception as e:
-            logger.error(f"清理缓存时出错: {str(e)}")
+        # 简化清理逻辑
+        logger.info("应用关闭")
 
 
 async def run(

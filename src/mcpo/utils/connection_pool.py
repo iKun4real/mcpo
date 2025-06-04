@@ -149,7 +149,7 @@ class ConnectionPool:
             self._stats['current_active'] -= 1
     
     async def _cleanup_idle_connections(self):
-        """清理空闲连接"""
+        """清理空闲连接，增强错误处理和资源管理"""
         while True:
             try:
                 await asyncio.sleep(30)  # 每30秒检查一次
@@ -166,20 +166,32 @@ class ConnectionPool:
 
                     for conn in connections_to_remove:
                         try:
-                            # 安全关闭会话
-                            await self._safe_close_session(conn.session)
+                            # 安全关闭会话，添加超时保护
+                            await asyncio.wait_for(
+                                self._safe_close_session(conn.session),
+                                timeout=10.0
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(f"关闭空闲连接超时: {id(conn)}")
                         except Exception as e:
                             logger.warning(f"关闭空闲连接时出错: {e}")
                         finally:
-                            self._connections.remove(conn)
-                            self._stats['total_destroyed'] += 1
-                            logger.debug(f"清理空闲连接，剩余连接数: {len(self._connections)}")
+                            # 确保连接被移除，即使关闭失败
+                            if conn in self._connections:
+                                self._connections.remove(conn)
+                                self._stats['total_destroyed'] += 1
+                                logger.debug(f"清理空闲连接，剩余连接数: {len(self._connections)}")
 
             except asyncio.CancelledError:
                 logger.info("连接池清理任务被取消")
                 break
             except Exception as e:
                 logger.error(f"清理空闲连接时出错: {e}")
+                # 短暂等待后继续，避免快速循环
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    break
 
     async def _safe_close_session(self, session):
         """安全关闭会话"""
@@ -194,15 +206,27 @@ class ConnectionPool:
             logger.warning(f"关闭会话时发生异常: {e}")
     
     async def _periodic_health_check(self):
-        """定期健康检查"""
+        """定期健康检查，增强错误处理"""
         while True:
             try:
                 await asyncio.sleep(self.config.health_check_interval)
-                await self._check_all_connections_health()
+                # 添加超时保护，防止健康检查卡住
+                await asyncio.wait_for(
+                    self._check_all_connections_health(),
+                    timeout=30.0
+                )
             except asyncio.CancelledError:
+                logger.info("连接池健康检查任务被取消")
                 break
+            except asyncio.TimeoutError:
+                logger.warning("连接池健康检查超时 (30秒)")
             except Exception as e:
                 logger.error(f"健康检查时出错: {e}")
+                # 短暂等待后继续，避免快速循环
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    break
     
     async def _check_all_connections_health(self):
         """检查所有连接健康状态"""
@@ -212,10 +236,10 @@ class ConnectionPool:
             for conn in self._connections:
                 if not conn.in_use:  # 只检查空闲连接
                     try:
-                        # 简单的健康检查
+                        # 简单的健康检查，统一使用3秒超时
                         await asyncio.wait_for(
                             conn.session.list_tools(),
-                            timeout=5.0
+                            timeout=3.0
                         )
                         conn.is_healthy = True
                         conn.error_count = 0
@@ -269,23 +293,46 @@ class ConnectionPool:
         }
     
     async def close(self):
-        """关闭连接池"""
+        """关闭连接池，确保资源正确释放"""
         logger.info(f"关闭连接池 {self.name}")
-        
-        # 取消后台任务
-        if self._cleanup_task:
+
+        # 取消后台任务并等待完成
+        tasks_to_cancel = []
+        if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
-        if self._health_check_task:
+            tasks_to_cancel.append(self._cleanup_task)
+        if self._health_check_task and not self._health_check_task.done():
             self._health_check_task.cancel()
-        
+            tasks_to_cancel.append(self._health_check_task)
+
+        # 等待任务取消完成，添加超时保护
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"连接池 {self.name} 后台任务取消超时")
+
         # 关闭所有连接
         async with self._lock:
-            for conn in self._connections:
+            connections_count = len(self._connections)
+            for conn in self._connections[:]:  # 使用副本避免修改列表时的问题
                 try:
-                    await conn.session.close()
-                except:
-                    pass
+                    await asyncio.wait_for(
+                        self._safe_close_session(conn.session),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"关闭连接超时: {id(conn)}")
+                except Exception as e:
+                    logger.warning(f"关闭连接时出错: {e}")
+
             self._connections.clear()
+            self._stats['total_destroyed'] += connections_count
+
+        logger.info(f"连接池 {self.name} 已关闭")
 
 
 class ConnectionPoolManager:
