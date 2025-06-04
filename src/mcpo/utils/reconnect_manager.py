@@ -183,19 +183,71 @@ class ReconnectManager:
         """获取健康的会话，如果不健康则尝试重连"""
         if name not in self.connections:
             return None
-        
-        # 检查当前状态
-        status = self.connection_status.get(name, {})
-        if status.get("status") == "healthy":
-            return self.connections[name]
-        
+
+        session = self.connections[name]
+
+        # 先进行实时健康检查
+        try:
+            await asyncio.wait_for(session.list_tools(), timeout=5.0)
+            # 更新健康状态
+            if name in self.connection_status:
+                self.connection_status[name].update({
+                    "status": "healthy",
+                    "last_check": time.time(),
+                    "last_error": None
+                })
+            return session
+        except Exception as e:
+            logger.warning(f"会话 {name} 健康检查失败: {str(e)}")
+            self.record_error(name, f"会话健康检查失败: {str(e)}")
+
         # 如果不健康且应该重连，则尝试重连
         if self.should_reconnect(name):
             success = await self.attempt_reconnect(name)
             if success:
                 return self.connections[name]
-        
+
         return None
+
+    async def refresh_connection_state(self, name: str) -> bool:
+        """刷新连接状态，强制重新验证会话健康"""
+        if name not in self.connections:
+            logger.warning(f"连接 {name} 不存在，无法刷新状态")
+            return False
+
+        try:
+            session = self.connections[name]
+            # 执行健康检查
+            await asyncio.wait_for(session.list_tools(), timeout=3.0)
+
+            # 更新状态
+            if name in self.connection_status:
+                self.connection_status[name].update({
+                    "status": "healthy",
+                    "last_check": time.time(),
+                    "last_error": None
+                })
+
+            logger.debug(f"连接状态刷新成功: {name}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"刷新连接状态失败 {name}: {str(e)}")
+            self.record_error(name, f"状态刷新失败: {str(e)}")
+            return False
+
+    async def validate_all_connections(self) -> Dict[str, bool]:
+        """验证所有连接的健康状态"""
+        results = {}
+        for name in list(self.connections.keys()):
+            try:
+                is_healthy = await self.refresh_connection_state(name)
+                results[name] = is_healthy
+            except Exception as e:
+                logger.error(f"验证连接 {name} 时发生异常: {str(e)}")
+                results[name] = False
+
+        return results
     
     def get_status(self, name: str) -> Dict[str, Any]:
         """获取连接状态"""

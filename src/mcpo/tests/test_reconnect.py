@@ -119,16 +119,22 @@ class TestReconnectManager:
         """测试获取健康会话"""
         config = {"url": "https://test.com", "headers": {}}
         manager.register_connection("test_conn", mock_session, mock_connection_factory, config)
-        
+
+        # 模拟健康的会话（list_tools成功）
+        mock_session.list_tools = AsyncMock(return_value=None)
+
         # 健康状态应该返回会话
         session = await manager.get_healthy_session("test_conn")
         assert session == mock_session
-        
-        # 不健康状态应该尝试重连
+
+        # 模拟不健康的会话（list_tools失败）
+        mock_session.list_tools = AsyncMock(side_effect=Exception("Connection failed"))
+
+        # 记录错误以满足重连条件
         manager.record_error("test_conn", "Error")
         manager.record_error("test_conn", "Error")
         manager.record_error("test_conn", "Error")
-        
+
         with patch.object(manager, 'attempt_reconnect') as mock_reconnect:
             mock_reconnect.return_value = True
             session = await manager.get_healthy_session("test_conn")

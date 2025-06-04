@@ -154,29 +154,44 @@ class ConnectionPool:
             try:
                 await asyncio.sleep(30)  # 每30秒检查一次
                 current_time = time.time()
-                
+
                 async with self._lock:
                     connections_to_remove = []
-                    
+
                     for conn in self._connections:
-                        if (not conn.in_use and 
+                        if (not conn.in_use and
                             current_time - conn.last_used > self.config.max_idle_time and
                             len(self._connections) > self.config.min_connections):
                             connections_to_remove.append(conn)
-                    
+
                     for conn in connections_to_remove:
                         try:
-                            await conn.session.close()
-                        except:
-                            pass
-                        self._connections.remove(conn)
-                        self._stats['total_destroyed'] += 1
-                        logger.debug(f"清理空闲连接，剩余连接数: {len(self._connections)}")
-                        
+                            # 安全关闭会话
+                            await self._safe_close_session(conn.session)
+                        except Exception as e:
+                            logger.warning(f"关闭空闲连接时出错: {e}")
+                        finally:
+                            self._connections.remove(conn)
+                            self._stats['total_destroyed'] += 1
+                            logger.debug(f"清理空闲连接，剩余连接数: {len(self._connections)}")
+
             except asyncio.CancelledError:
+                logger.info("连接池清理任务被取消")
                 break
             except Exception as e:
                 logger.error(f"清理空闲连接时出错: {e}")
+
+    async def _safe_close_session(self, session):
+        """安全关闭会话"""
+        try:
+            if hasattr(session, 'close'):
+                await asyncio.wait_for(session.close(), timeout=5.0)
+            elif hasattr(session, '__aexit__'):
+                await session.__aexit__(None, None, None)
+        except asyncio.TimeoutError:
+            logger.warning("关闭会话超时")
+        except Exception as e:
+            logger.warning(f"关闭会话时发生异常: {e}")
     
     async def _periodic_health_check(self):
         """定期健康检查"""
@@ -193,32 +208,56 @@ class ConnectionPool:
         """检查所有连接健康状态"""
         async with self._lock:
             unhealthy_connections = []
-            
+
             for conn in self._connections:
                 if not conn.in_use:  # 只检查空闲连接
                     try:
                         # 简单的健康检查
                         await asyncio.wait_for(
-                            conn.session.list_tools(), 
+                            conn.session.list_tools(),
                             timeout=5.0
                         )
                         conn.is_healthy = True
                         conn.error_count = 0
-                    except Exception:
+                        logger.debug(f"连接健康检查通过: {id(conn)}")
+                    except Exception as e:
                         conn.is_healthy = False
                         conn.error_count += 1
+                        logger.warning(f"连接健康检查失败: {id(conn)}, 错误: {str(e)}, 错误次数: {conn.error_count}")
+
+                        # 连续失败3次则标记为不健康
                         if conn.error_count >= 3:
                             unhealthy_connections.append(conn)
-            
+
             # 移除不健康的连接
             for conn in unhealthy_connections:
                 try:
-                    await conn.session.close()
-                except:
-                    pass
-                self._connections.remove(conn)
-                self._stats['total_destroyed'] += 1
-                logger.warning(f"移除不健康连接，剩余连接数: {len(self._connections)}")
+                    await self._safe_close_session(conn.session)
+                except Exception as e:
+                    logger.warning(f"关闭不健康连接时出错: {e}")
+                finally:
+                    self._connections.remove(conn)
+                    self._stats['total_destroyed'] += 1
+                    logger.warning(f"移除不健康连接，剩余连接数: {len(self._connections)}")
+
+    async def force_health_check(self) -> Dict[str, bool]:
+        """强制执行健康检查并返回结果"""
+        results = {}
+        async with self._lock:
+            for i, conn in enumerate(self._connections):
+                conn_id = f"conn_{i}"
+                try:
+                    await asyncio.wait_for(conn.session.list_tools(), timeout=3.0)
+                    conn.is_healthy = True
+                    conn.error_count = 0
+                    results[conn_id] = True
+                except Exception as e:
+                    conn.is_healthy = False
+                    conn.error_count += 1
+                    results[conn_id] = False
+                    logger.warning(f"连接 {conn_id} 健康检查失败: {str(e)}")
+
+        return results
     
     def get_stats(self) -> Dict[str, Any]:
         """获取连接池统计信息"""

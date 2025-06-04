@@ -3,6 +3,7 @@ import os
 import logging
 import socket
 import asyncio
+import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Optional
 
@@ -274,17 +275,51 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None, connection
             try:
                 from mcpo.utils.performance import performance_monitor, concurrency_limiter
                 from mcpo.utils.cache import cache_manager
+                from mcpo.utils.error_recovery import error_recovery_manager
+                from mcpo.utils.system_monitor import system_monitor
 
                 return {
                     "performance": performance_monitor.get_metrics(),
                     "concurrency": concurrency_limiter.get_stats(),
                     "cache": cache_manager.get_all_stats(),
                     "connection": connection_manager.get_connection_status(connection_name),
+                    "error_recovery": error_recovery_manager.get_error_statistics(),
+                    "system_health": error_recovery_manager.get_system_health().__dict__,
                     "timestamp": time.time()
                 }
             except Exception as e:
                 logger.error(f"获取性能指标失败: {str(e)}")
                 return {
+                    "error": str(e),
+                    "timestamp": time.time()
+                }
+
+        # 添加系统诊断端点
+        @app.get("/diagnostics", summary="系统诊断", description="执行系统诊断并返回结果")
+        async def system_diagnostics():
+            """系统诊断"""
+            try:
+                from mcpo.utils.system_monitor import system_monitor
+                from mcpo.utils.reconnect_manager import reconnect_manager
+
+                # 执行诊断
+                diagnostic_result = await system_monitor.diagnose_system()
+
+                # 验证所有连接
+                connection_health = await reconnect_manager.validate_all_connections()
+
+                return {
+                    "status": diagnostic_result.status,
+                    "issues": diagnostic_result.issues,
+                    "recommendations": diagnostic_result.recommendations,
+                    "metrics": diagnostic_result.metrics.__dict__ if diagnostic_result.metrics else None,
+                    "connection_health": connection_health,
+                    "timestamp": time.time()
+                }
+            except Exception as e:
+                logger.error(f"系统诊断失败: {str(e)}")
+                return {
+                    "status": "error",
                     "error": str(e),
                     "timestamp": time.time()
                 }
@@ -298,111 +333,136 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None, connection
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    server_type = getattr(app.state, "server_type", "stdio")
-    command = getattr(app.state, "command", None)
-    args = getattr(app.state, "args", [])
-    env = getattr(app.state, "env", {})
-    headers = getattr(app.state, "headers", {})
+    # 启动监控系统
+    from mcpo.utils.system_monitor import system_monitor
+    from mcpo.utils.error_recovery import error_recovery_manager
 
-    args = args if isinstance(args, list) else [args]
-    api_dependency = getattr(app.state, "api_dependency", None)
+    try:
+        # 启动系统监控
+        await system_monitor.start_monitoring()
+        logger.info("系统监控已启动")
 
-    if (server_type == "stdio" and not command) or (
-        server_type == "sse" and not args[0]
-    ):
-        # Main app lifespan (when config_path is provided)
-        async with AsyncExitStack() as stack:
-            for route in app.routes:
-                if isinstance(route, Mount) and isinstance(route.app, FastAPI):
-                    await stack.enter_async_context(
-                        route.app.router.lifespan_context(route.app),  # noqa
-                    )
-            yield
-    else:
-        if server_type == "stdio":
-            server_params = StdioServerParameters(
-                command=command,
-                args=args,
-                env={**env},
-            )
+        server_type = getattr(app.state, "server_type", "stdio")
+        command = getattr(app.state, "command", None)
+        args = getattr(app.state, "args", [])
+        env = getattr(app.state, "env", {})
+        headers = getattr(app.state, "headers", {})
 
-            async def create_stdio_connection():
-                return stdio_client(server_params)
+        args = args if isinstance(args, list) else [args]
+        api_dependency = getattr(app.state, "api_dependency", None)
 
-            try:
-                connection_context = await retry_connection(
-                    create_stdio_connection,
-                    connection_name=f"Stdio MCP Server ({command})"
+        if (server_type == "stdio" and not command) or (
+            server_type == "sse" and not args[0]
+        ):
+            # Main app lifespan (when config_path is provided)
+            async with AsyncExitStack() as stack:
+                for route in app.routes:
+                    if isinstance(route, Mount) and isinstance(route.app, FastAPI):
+                        await stack.enter_async_context(
+                            route.app.router.lifespan_context(route.app),  # noqa
+                        )
+                yield
+        else:
+            if server_type == "stdio":
+                server_params = StdioServerParameters(
+                    command=command,
+                    args=args,
+                    env={**env},
                 )
-                async with connection_context as (reader, writer):
-                    async with ClientSession(reader, writer) as session:
+
+                async def create_stdio_connection():
+                    return stdio_client(server_params)
+
+                try:
+                    connection_context = await retry_connection(
+                        create_stdio_connection,
+                        connection_name=f"Stdio MCP Server ({command})"
+                    )
+                    async with connection_context as (reader, writer):
+                        async with ClientSession(reader, writer) as session:
+                            app.state.session = session
+                            await create_dynamic_endpoints(
+                                app,
+                                api_dependency=api_dependency,
+                                connection_name=f"Stdio-{command}",
+                                connection_manager=getattr(app.state, 'connection_manager', None)
+                            )
+                            yield
+                except Exception as e:
+                    logger.error(f"Stdio MCP服务器连接失败: {str(e)}")
+                    raise
+
+            if server_type == "sse":
+                url = args[0]
+
+                async def create_sse_connection():
+                    return sse_client(
+                        url=url,
+                        headers=headers,
+                        sse_read_timeout=DEFAULT_SSE_READ_TIMEOUT
+                    )
+
+                try:
+                    connection_context = await retry_connection(
+                        lambda: create_connection_with_timeout(create_sse_connection),
+                        connection_name=f"SSE MCP Server ({url})"
+                    )
+                    async with connection_context as (reader, writer):
+                        async with ClientSession(reader, writer) as session:
+                            app.state.session = session
+                            await create_dynamic_endpoints(
+                                app,
+                                api_dependency=api_dependency,
+                                connection_name=f"SSE-{url}",
+                                connection_manager=getattr(app.state, 'connection_manager', None)
+                            )
+                            yield
+                except Exception as e:
+                    logger.error(f"SSE MCP服务器连接失败: {str(e)}")
+                    raise
+
+            if server_type == "streamablehttp" or server_type == "streamable_http":
+                # Ensure URL has trailing slash to avoid redirects
+                url = args[0]
+                if not url.endswith("/"):
+                    url = f"{url}/"
+
+                # 使用弹性连接管理器
+                from mcpo.utils.reconnect_manager import resilient_streamable_connection, reconnect_manager
+
+                try:
+                    async with resilient_streamable_connection(url, headers, app) as session:
                         app.state.session = session
+                        connection_name = f"StreamableHTTP-{url}"
+
+                        # 弹性连接已经处理了重连管理器的注册，这里只需要创建端点
                         await create_dynamic_endpoints(
                             app,
                             api_dependency=api_dependency,
-                            connection_name=f"Stdio-{command}",
+                            connection_name=connection_name,
                             connection_manager=getattr(app.state, 'connection_manager', None)
                         )
                         yield
-            except Exception as e:
-                logger.error(f"Stdio MCP服务器连接失败: {str(e)}")
-                raise
 
-        if server_type == "sse":
-            url = args[0]
+                except Exception as e:
+                    logger.error(f"StreamableHTTP MCP服务器连接失败: {str(e)}")
+                    raise
 
-            async def create_sse_connection():
-                return sse_client(
-                    url=url,
-                    headers=headers,
-                    sse_read_timeout=DEFAULT_SSE_READ_TIMEOUT
-                )
+    finally:
+        # 关闭监控系统
+        try:
+            await system_monitor.stop_monitoring()
+            logger.info("系统监控已停止")
+        except Exception as e:
+            logger.error(f"停止系统监控时出错: {str(e)}")
 
-            try:
-                connection_context = await retry_connection(
-                    lambda: create_connection_with_timeout(create_sse_connection),
-                    connection_name=f"SSE MCP Server ({url})"
-                )
-                async with connection_context as (reader, writer):
-                    async with ClientSession(reader, writer) as session:
-                        app.state.session = session
-                        await create_dynamic_endpoints(
-                            app,
-                            api_dependency=api_dependency,
-                            connection_name=f"SSE-{url}",
-                            connection_manager=getattr(app.state, 'connection_manager', None)
-                        )
-                        yield
-            except Exception as e:
-                logger.error(f"SSE MCP服务器连接失败: {str(e)}")
-                raise
-
-        if server_type == "streamablehttp" or server_type == "streamable_http":
-            # Ensure URL has trailing slash to avoid redirects
-            url = args[0]
-            if not url.endswith("/"):
-                url = f"{url}/"
-
-            # 使用弹性连接管理器
-            from mcpo.utils.reconnect_manager import resilient_streamable_connection, reconnect_manager
-
-            try:
-                async with resilient_streamable_connection(url, headers, app) as session:
-                    app.state.session = session
-                    connection_name = f"StreamableHTTP-{url}"
-
-                    # 弹性连接已经处理了重连管理器的注册，这里只需要创建端点
-                    await create_dynamic_endpoints(
-                        app,
-                        api_dependency=api_dependency,
-                        connection_name=connection_name,
-                        connection_manager=getattr(app.state, 'connection_manager', None)
-                    )
-                    yield
-
-            except Exception as e:
-                logger.error(f"StreamableHTTP MCP服务器连接失败: {str(e)}")
-                raise
+        # 清理缓存
+        try:
+            from mcpo.utils.cache import cache_manager
+            await cache_manager.default_cache.cleanup_and_shutdown()
+            logger.info("缓存系统已清理")
+        except Exception as e:
+            logger.error(f"清理缓存时出错: {str(e)}")
 
 
 async def run(

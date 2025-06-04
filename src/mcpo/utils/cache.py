@@ -193,9 +193,25 @@ class SmartCache:
                 await asyncio.sleep(60)  # 每分钟清理一次
                 await self._cleanup_expired()
             except asyncio.CancelledError:
+                logger.info("缓存清理任务被取消")
                 break
             except Exception as e:
                 logger.error(f"缓存清理时出错: {e}")
+
+    async def cleanup_and_shutdown(self):
+        """清理缓存并关闭"""
+        try:
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+
+            await self.clear()
+            logger.info("缓存已清理并关闭")
+        except Exception as e:
+            logger.error(f"缓存关闭时出错: {e}")
     
     async def _cleanup_expired(self):
         """清理过期缓存"""
